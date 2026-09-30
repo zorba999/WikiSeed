@@ -307,7 +307,7 @@ export function BountyDrawer() {
                   <button className="btn btn--sand btn--block" disabled={now < readyAt || busy} onClick={() => run("Finalizing bounty", "finalize", [view.id])}>
                     {busy ? "Checking Wikipedia…" : "Finalize & release reward"}
                   </button>
-                  <p className="note">Anyone can finalize. Validators check the article still exists and kept at least 60% of its words.</p>
+                  <p className="note">Anyone can finalize. Validators re-judge the live article against the full bounty: length, references, language, topic and translation quality.</p>
                 </div>
               )}
 

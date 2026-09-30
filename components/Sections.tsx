@@ -190,7 +190,7 @@ const CHAPTERS = [
   },
   {
     t: "Harvest",
-    b: "After the survival window, anyone can finalize. If the article still stands on Wikipedia, the reward is released to the writer. If it was deleted, the bounty reopens.",
+    b: "After the survival window, anyone can finalize. Validators re-judge the live article against every criterion. If it still qualifies, the writer is paid; if it was deleted or rewritten away from the brief, the bounty reopens.",
     tech: ["Optimistic Democracy", "appeals", "withdraw()"],
   },
 ];

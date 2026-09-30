@@ -7,8 +7,9 @@ account to their wallet, writes the article, and claims with a revision id.
 Validators read Wikipedia directly (MediaWiki API), recompute the objective
 facts (authorship, words, references) and independently ask their own LLM to
 judge language, topic fit, machine-translation quality and sources. After a
-survival window the article is checked again, and only then is the reward
-released (pull payment via `withdraw`).
+survival window the live article is re-judged against every bounty criterion
+(length, references, language, topic, translation quality), and only then is
+the reward released (pull payment via `withdraw`).
 """
 
 import datetime
@@ -25,7 +26,7 @@ WIKI_CODE_RE = re.compile(r"^[a-z][a-z0-9-]{1,19}$")
 # Where a contributor may publish the wallet address on their user page.
 LINK_HOSTS = ["meta.wikimedia.org", "test.wikipedia.org", "en.wikipedia.org"]
 MAX_LLM_CHARS = 9000
-SURVIVAL_RATIO = 0.6  # at finalize, the article must keep >= 60% of claimed words
+SURVIVAL_RATIO = 0.6  # at finalize, the article must also keep >= 60% of claimed words
 
 
 # ─────────────────────────── storage types ───────────────────────────
@@ -240,6 +241,54 @@ def _clean_llm(raw) -> dict:
     }
 
 
+def article_material(content: str) -> tuple:
+    """Plain text, reference list and the LLM review material for a wikitext revision."""
+    text = wikitext_to_text(content)
+    refs = extract_refs(content)
+    digest = "\n".join(f"- {wikitext_to_text(r)[:160] or r[:160]}" for r in refs[:20])
+    return text, refs, text[:MAX_LLM_CHARS] + "\n\nREFERENCES:\n" + digest
+
+
+def review_prompt(language: str, topic: str, brief: str, material: str) -> str:
+    return f"""You are a strict reviewer for a Wikipedia bounty program in under-served languages.
+
+BOUNTY
+- Required language: {language}
+- Required topic: {topic}
+- Sponsor brief: {brief or "(none)"}
+
+ARTICLE (plain text extracted from wikitext, may be truncated)
+<<<
+{material}
+>>>
+
+Evaluate ONLY the article above and reply with a JSON object with exactly these keys:
+- "language_ok": true if the article body is written in {language} (proper nouns and citations in other languages are fine)
+- "language_score": integer 0-10, fluency and correctness of the {language} text
+- "topic_match": true if the article is substantially about "{topic}"
+- "topic_score": integer 0-10, how well it covers the topic and the sponsor brief
+- "machine_translation_risk": integer 0-10, 10 = obviously raw/poor machine translation (calques, broken grammar, untranslated fragments)
+- "sources_score": integer 0-10, relevance and reliability of the listed references (0 if none)
+- "summary": one sentence in English describing the article
+- "reason": at most two sentences in English justifying the scores
+"""
+
+
+def verdict_agrees(lead: dict, mine: dict, min_refs: int) -> bool:
+    """Validator rule shared by the claim and finalize reviews."""
+    if lead.get("stage") != mine["stage"]:
+        return False
+    if mine["stage"] == "facts":
+        return lead.get("passed") == mine["passed"]
+    # the leader's verdict must follow from its own scores
+    if derive_pass(lead.get("llm") or {}, min_refs) != lead.get("passed"):
+        return False
+    # accept unless our own independent review clearly contradicts it (±1 tolerance band)
+    if lead.get("passed"):
+        return derive_pass(mine["llm"], min_refs, slack=1)
+    return not derive_pass(mine["llm"], min_refs, slack=-1)
+
+
 # ─────────────────────────── contract ───────────────────────────
 
 
@@ -432,21 +481,20 @@ class WikiSeed(gl.Contract):
                 {"prop": "revisions", "pageids": str(page["pageid"]), "rvdir": "newer", "rvlimit": "1", "rvprop": "user|timestamp"},
             )
             frev = first["query"]["pages"][0]["revisions"][0]
-            text = wikitext_to_text(content)
-            refs = extract_refs(content)
+            text, refs, material = article_material(content)
             facts = {
                 "found": True,
                 "title": page.get("title", ""),
                 "pageid": int(page["pageid"]),
                 "ns": int(page.get("ns", -1)),
                 "redirect": bool(page.get("redirect", False)) or content.lstrip().upper().startswith("#REDIRECT"),
+                "rev_user": _normalize_user(rev.get("user", "")),
                 "creator": _normalize_user(frev.get("user", "")),
                 "created_ts": frev.get("timestamp", ""),
                 "words": count_words(text),
                 "refs": len(refs),
             }
-            ref_digest = "\n".join(f"- {wikitext_to_text(r)[:160] or r[:160]}" for r in refs[:20])
-            return facts, text[:MAX_LLM_CHARS] + "\n\nREFERENCES:\n" + ref_digest
+            return facts, material
 
         def check_facts(f: dict) -> str:
             if not f.get("found"):
@@ -455,6 +503,9 @@ class WikiSeed(gl.Contract):
                 return "Revision is not in the article namespace"
             if f["redirect"]:
                 return "Page is a redirect"
+            # The claimant must have saved the exact revision being judged, and created the page.
+            if f["rev_user"] != user:
+                return f"Submitted revision was saved by {f['rev_user']}, not {user}"
             if f["creator"] != user:
                 return f"Article was created by {f['creator']}, not {user}"
             if _parse_ts(f["created_ts"]) < not_before:
@@ -465,36 +516,12 @@ class WikiSeed(gl.Contract):
                 return f"Only {f['refs']} references (needs {min_refs})"
             return ""
 
-        def build_prompt(material: str) -> str:
-            return f"""You are a strict reviewer for a Wikipedia bounty program in under-served languages.
-
-BOUNTY
-- Required language: {language}
-- Required topic: {topic}
-- Sponsor brief: {brief or "(none)"}
-
-ARTICLE (plain text extracted from wikitext, may be truncated)
-<<<
-{material}
->>>
-
-Evaluate ONLY the article above and reply with a JSON object with exactly these keys:
-- "language_ok": true if the article body is written in {language} (proper nouns and citations in other languages are fine)
-- "language_score": integer 0-10, fluency and correctness of the {language} text
-- "topic_match": true if the article is substantially about "{topic}"
-- "topic_score": integer 0-10, how well it covers the topic and the sponsor brief
-- "machine_translation_risk": integer 0-10, 10 = obviously raw/poor machine translation (calques, broken grammar, untranslated fragments)
-- "sources_score": integer 0-10, relevance and reliability of the listed references (0 if none)
-- "summary": one sentence in English describing the article
-- "reason": at most two sentences in English justifying the scores
-"""
-
         def leader_fn():
             facts, material = fetch_article()
             reason = check_facts(facts)
             if reason:
                 return {"facts": facts, "passed": False, "stage": "facts", "reason": reason, "llm": {}}
-            llm = _clean_llm(gl.nondet.exec_prompt(build_prompt(material), response_format="json"))
+            llm = _clean_llm(gl.nondet.exec_prompt(review_prompt(language, topic, brief, material), response_format="json"))
             ok = derive_pass(llm, min_refs)
             return {"facts": facts, "passed": ok, "stage": "llm", "reason": llm["reason"], "llm": llm}
 
@@ -503,17 +530,9 @@ Evaluate ONLY the article above and reply with a JSON object with exactly these 
                 return False
             lead = leader_result.calldata
             mine = leader_fn()
-            if lead.get("facts") != mine["facts"] or lead.get("stage") != mine["stage"]:
-                return False
-            if mine["stage"] == "llm" and derive_pass(lead.get("llm", {}), min_refs) != lead.get("passed"):
-                return False  # leader's verdict must follow from its own scores
-            if mine["stage"] == "facts":
-                return lead.get("passed") == mine["passed"]
-            # LLM stage: accept the leader's verdict unless our own review clearly
-            # contradicts it (outside a one-point tolerance band).
-            if lead.get("passed"):
-                return derive_pass(mine["llm"], min_refs, slack=1)
-            return not derive_pass(mine["llm"], min_refs, slack=-1)
+            if lead.get("facts") != mine["facts"]:
+                return False  # a revision is immutable, so its facts must match exactly
+            return verdict_agrees(lead, mine, min_refs)
 
         result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
         facts, llm = result["facts"], result.get("llm") or {}
@@ -551,29 +570,42 @@ Evaluate ONLY the article above and reply with a JSON object with exactly these 
 
         host = _wiki_host(b.wiki)
         pageid, claimed = int(b.claim_pageid), int(b.claim_words)
+        language, topic, brief = b.language, b.topic, b.brief
+        min_words, min_refs = int(b.min_words), int(b.min_refs)
+        floor = max(min_words, int(claimed * SURVIVAL_RATIO))
 
         def leader_fn():
+            # What gets paid for is the live article, not the approved revision:
+            # it must still meet every criterion that earned the approval.
             data = _api(host, {"prop": "revisions|info", "pageids": str(pageid), "rvprop": "ids|content", "rvslots": "main"})
             pages = data.get("query", {}).get("pages", [])
+            gone = {"stage": "facts", "passed": False, "words": 0, "refs": 0, "llm": {}}
             if not pages or pages[0].get("missing") or not pages[0].get("revisions"):
-                return {"alive": False, "words": 0, "reason": "Article was deleted"}
+                return {**gone, "reason": "Article was deleted"}
             page = pages[0]
             content = page["revisions"][0].get("slots", {}).get("main", {}).get("content", "")
             if page.get("ns") != 0 or page.get("redirect") or content.lstrip().upper().startswith("#REDIRECT"):
-                return {"alive": False, "words": 0, "reason": "Article was moved out or turned into a redirect"}
-            words = count_words(wikitext_to_text(content))
-            if words < claimed * SURVIVAL_RATIO:
-                return {"alive": False, "words": words, "reason": f"Article shrank to {words} words (claimed {claimed})"}
-            return {"alive": True, "words": words, "reason": "Article survived the review window"}
+                return {**gone, "reason": "Article was moved out or turned into a redirect"}
+            text, refs, material = article_material(content)
+            out = {**gone, "words": count_words(text), "refs": len(refs)}
+            if out["words"] < floor:
+                return {**out, "reason": f"Article now has {out['words']} words (needs {floor})"}
+            if out["refs"] < min_refs:
+                return {**out, "reason": f"Article now has {out['refs']} references (needs {min_refs})"}
+            llm = _clean_llm(gl.nondet.exec_prompt(review_prompt(language, topic, brief, material), response_format="json"))
+            ok = derive_pass(llm, min_refs)
+            prefix = "Current article still meets the bounty. " if ok else "Current article no longer meets the bounty. "
+            return {**out, "stage": "llm", "passed": ok, "reason": prefix + llm["reason"], "llm": llm}
 
         def validator_fn(leader_result) -> bool:
             if not isinstance(leader_result, gl.vm.Return):
                 return False
-            return leader_result.calldata.get("alive") == leader_fn()["alive"]
+            # the live page may be edited between executions: compare verdicts, not raw counts
+            return verdict_agrees(leader_result.calldata, leader_fn(), min_refs)
 
         res = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
-        alive = bool(res["alive"])
-        self._log(b, "finalize", b.claim_user, b.claim_title, int(b.claim_revid), alive, "survival", res["reason"], int(res["words"]), int(b.claim_refs))
+        alive = bool(res["passed"])
+        self._log(b, "finalize", b.claim_user, b.claim_title, int(b.claim_revid), alive, res["stage"], res["reason"], int(res["words"]), int(res["refs"]))
 
         if alive:
             b.status = "PAID"
@@ -593,7 +625,7 @@ Evaluate ONLY the article above and reply with a JSON object with exactly these 
             b.approved_at = 0
             b.summary = ""
             b.verdict = res["reason"]
-        return {"alive": alive, "reason": res["reason"], "words": int(res["words"])}
+        return {"alive": alive, "stage": res["stage"], "reason": res["reason"], "words": int(res["words"]), "refs": int(res["refs"])}
 
     @gl.public.write
     def cancel_bounty(self, bounty_id: str) -> None:

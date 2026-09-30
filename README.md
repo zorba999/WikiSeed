@@ -4,7 +4,7 @@ Bounties for Wikipedia articles in under-served languages (Faroese, Wolof, Quech
 GenLayer's AI validators and paid on-chain. No moderators, no oracle.
 
 - **Network:** GenLayer **Studionet** (chain `61999`, RPC `https://studio.genlayer.com/api`)
-- **Contract:** [`0xfD6BE144C962a5760b6F675FCCf72a721E247FF5`](https://explorer-studio.genlayer.com/address/0xfD6BE144C962a5760b6F675FCCf72a721E247FF5)
+- **Contract:** [`0x3465bF7Ae4381214538c717e9851046575CeaE9c`](https://explorer-studio.genlayer.com/address/0x3465bF7Ae4381214538c717e9851046575CeaE9c)
 - **Frontend:** Next.js 16 · GSAP (SplitText, ScrollTrigger, CustomEase) · Lenis · wagmi v3 wallet adapter · genlayer-js
 
 ## How it works
@@ -13,8 +13,8 @@ GenLayer's AI validators and paid on-chain. No moderators, no oracle.
 |---|---|---|
 | Sponsor locks GEN on a topic + language | `create_bounty` (payable) | `gl.message.value` |
 | Writer links Wikipedia account ↔ wallet | `link_wiki_account` | `gl.nondet.web.get` + `strict_eq` (User page must contain the wallet and be saved by that user) |
-| Writer claims with a revision id | `submit_claim` | MediaWiki API facts (creator, created date, words, refs) + each validator's own LLM judges language, topic, machine-translation risk and sources — `run_nondet_unsafe` with exact fact matching and a ±1 tolerance band on the verdict |
-| After the survival window | `finalize` (anyone) | validators re-read the page: still exists, not a redirect, ≥ 60 % of claimed words |
+| Writer claims with a revision id | `submit_claim` | MediaWiki API facts (the submitted revision must be saved by the claimant, who must also have created the page; created date, words, refs) + each validator's own LLM judges language, topic, machine-translation risk and sources — `run_nondet_unsafe` with exact fact matching and a ±1 tolerance band on the verdict |
+| After the survival window | `finalize` (anyone) | validators re-judge the **live** article against the full bounty: exists, not a redirect, ≥ min words and ≥ 60 % of claimed words, ≥ min refs, and a fresh LLM review of language / topic / MT risk / sources |
 | Pull payment | `withdraw` | `emit_transfer` to the EOA |
 | Refunds | `cancel_bounty` (sponsor) / `expire_bounty` (anyone after deadline) | |
 

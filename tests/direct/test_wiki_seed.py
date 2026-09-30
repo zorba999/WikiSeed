@@ -40,10 +40,11 @@ def mock_user_page(vm, user, wallet_hex):
     )
 
 
-def mock_article(vm, creator="Alice Writer", content=ARTICLE, created="2030-01-02T00:00:00Z"):
+def mock_article(vm, creator="Alice Writer", content=ARTICLE, created="2030-01-02T00:00:00Z", rev_user=None):
+    """`creator` made the page; `rev_user` (defaults to creator) saved the submitted revision."""
     vm.mock_web(
         r"fo\.wikipedia\.org/w/api\.php.*revids=",
-        body({"query": {"pages": [{"pageid": 42, "ns": 0, "title": "Havnin í Tórshavn", "revisions": [{"revid": 777, "user": creator, "timestamp": created, "slots": {"main": {"content": content}}}]}]}}),
+        body({"query": {"pages": [{"pageid": 42, "ns": 0, "title": "Havnin í Tórshavn", "revisions": [{"revid": 777, "user": rev_user or creator, "timestamp": created, "slots": {"main": {"content": content}}}]}]}}),
     )
     vm.mock_web(
         r"fo\.wikipedia\.org/w/api\.php.*rvdir=newer",
@@ -153,7 +154,7 @@ def test_claim_too_short_stays_open(direct_vm, setup):
 def test_claim_wrong_creator(direct_vm, setup):
     c, _, alice, bid = setup
     link(direct_vm, c, alice)
-    mock_article(direct_vm, creator="Someone Else")
+    mock_article(direct_vm, creator="Someone Else", rev_user="Alice Writer")
     direct_vm.warp("2030-01-03T00:00:00Z")
     res = c.submit_claim(bid, 777)
     assert res["passed"] is False and "created by" in res["reason"]
@@ -225,3 +226,126 @@ def test_validator_tolerates_borderline_scores(direct_vm, setup):
     mock_article(direct_vm)
     direct_vm.mock_llm(r"Wikipedia bounty", json.dumps(borderline))
     assert direct_vm.run_validator() is False
+
+
+# ─── payout integrity: authorship of the exact revision ───
+
+
+def test_claim_rejects_revision_saved_by_another_editor(direct_vm, setup):
+    """Claimant created the page, but the submitted qualifying revision was written by someone else."""
+    c, _, alice, bid = setup
+    link(direct_vm, c, alice)
+    mock_article(direct_vm, creator="Alice Writer", rev_user="Other Editor")
+    direct_vm.mock_llm(r"Wikipedia bounty", GOOD_LLM)
+    direct_vm.warp("2030-01-03T00:00:00Z")
+    res = c.submit_claim(bid, 777)
+    assert res["passed"] is False and res["stage"] == "facts"
+    assert "saved by Other Editor" in res["reason"]
+    assert c.get_bounty(bid)["status"] == "OPEN"
+    assert direct_vm.run_validator() is True  # validators agree on the rejection
+
+
+def test_claim_rejects_revision_by_claimant_on_page_created_by_other(direct_vm, setup):
+    c, _, alice, bid = setup
+    link(direct_vm, c, alice)
+    mock_article(direct_vm, creator="Other Editor", rev_user="Alice Writer")
+    direct_vm.warp("2030-01-03T00:00:00Z")
+    res = c.submit_claim(bid, 777)
+    assert res["passed"] is False and "created by Other Editor" in res["reason"]
+
+
+# ─── payout integrity: finalize re-judges the live article ───
+
+OFF_TOPIC_REWRITE = (
+    "Fótbóltsfelagið HB er eitt av elstu fótbóltsfeløgunum í Føroyum og hevur vunnið nógv meistaraskap. " * 70
+    + "<ref>{{cite web|url=https://www.hb.fo|title=HB}}</ref><ref>FSF 2020</ref><ref>Dimmalætting 2021</ref>"
+)
+OFF_TOPIC_LLM = json.dumps(
+    {
+        "language_ok": True,
+        "language_score": 8,
+        "topic_match": False,
+        "topic_score": 1,
+        "machine_translation_risk": 2,
+        "sources_score": 6,
+        "summary": "An article about the HB football club.",
+        "reason": "Fluent Faroese but about a football club, not the port of Tórshavn.",
+    }
+)
+
+
+def approve(vm, c, alice, bid):
+    link(vm, c, alice)
+    mock_article(vm)
+    vm.mock_llm(r"Wikipedia bounty", GOOD_LLM)
+    vm.warp("2030-01-03T00:00:00Z")
+    assert c.submit_claim(bid, 777)["passed"]
+    vm.warp("2030-01-05T00:00:00Z")  # survival window (24h) is over
+    vm.clear_mocks()
+
+
+def test_finalize_rejects_rewrite_that_keeps_words_but_changes_topic(direct_vm, setup):
+    """Adversarial: after approval the page is rewritten with as many words and refs, but off-topic."""
+    c, _, alice, bid = setup
+    approve(direct_vm, c, alice, bid)
+    mock_current(direct_vm, content=OFF_TOPIC_REWRITE)
+    direct_vm.mock_llm(r"Wikipedia bounty", OFF_TOPIC_LLM)
+    out = c.finalize(bid)
+    assert out["alive"] is False and out["stage"] == "llm"
+    assert out["words"] >= 300 and out["refs"] >= 2  # the old length/existence check would have paid
+    b = c.get_bounty(bid)
+    assert b["status"] == "OPEN" and b["claim_user"] == ""
+    assert c.get_account("0x" + alice.hex())["claimable"] == "0"
+    assert c.get_attempts(bid)[0]["kind"] == "finalize" and c.get_attempts(bid)[0]["passed"] is False
+
+
+def test_finalize_rejects_rewrite_into_machine_translation(direct_vm, setup):
+    c, _, alice, bid = setup
+    approve(direct_vm, c, alice, bid)
+    mock_current(direct_vm)
+    bad = json.loads(GOOD_LLM)
+    bad["machine_translation_risk"] = 9
+    direct_vm.mock_llm(r"Wikipedia bounty", json.dumps(bad))
+    assert c.finalize(bid)["alive"] is False
+    assert c.get_bounty(bid)["status"] == "OPEN"
+
+
+def test_finalize_rejects_rewrite_that_strips_references(direct_vm, setup):
+    c, _, alice, bid = setup
+    approve(direct_vm, c, alice, bid)
+    no_refs = ARTICLE.split("<ref>")[0]
+    mock_current(direct_vm, content=no_refs)
+    direct_vm.mock_llm(r"Wikipedia bounty", GOOD_LLM)
+    out = c.finalize(bid)
+    assert out["alive"] is False and out["stage"] == "facts" and "references" in out["reason"]
+
+
+def test_finalize_rejects_shrink_below_min_words(direct_vm, setup):
+    c, _, alice, bid = setup
+    approve(direct_vm, c, alice, bid)
+    short_article = "Havnin í Tórshavn er gomul. " * 20 + "<ref>a</ref><ref>b</ref>"
+    mock_current(direct_vm, content=short_article)
+    direct_vm.mock_llm(r"Wikipedia bounty", GOOD_LLM)
+    out = c.finalize(bid)
+    assert out["alive"] is False and "words" in out["reason"]
+
+
+def test_finalize_validator_rejects_leader_that_pays_an_off_topic_rewrite(direct_vm, setup):
+    c, _, alice, bid = setup
+    approve(direct_vm, c, alice, bid)
+    mock_current(direct_vm, content=OFF_TOPIC_REWRITE)
+    direct_vm.mock_llm(r"Wikipedia bounty", OFF_TOPIC_LLM)
+    c.finalize(bid)
+    lying = {"stage": "llm", "passed": True, "words": 900, "refs": 3, "reason": "", "llm": json.loads(GOOD_LLM)}
+    assert direct_vm.run_validator(leader_result=lying) is False
+
+
+def test_finalize_pays_when_live_article_still_qualifies(direct_vm, setup):
+    c, _, alice, bid = setup
+    approve(direct_vm, c, alice, bid)
+    mock_current(direct_vm)
+    direct_vm.mock_llm(r"Wikipedia bounty", GOOD_LLM)
+    out = c.finalize(bid)
+    assert out["alive"] is True and out["stage"] == "llm"
+    assert direct_vm.run_validator() is True
+    assert c.get_account("0x" + alice.hex())["claimable"] == str(5 * GEN)

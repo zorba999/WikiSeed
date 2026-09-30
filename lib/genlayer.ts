@@ -3,7 +3,7 @@ import { studionet } from "genlayer-js/chains";
 import { defineChain, type EIP1193Provider } from "viem";
 
 export const CONTRACT_ADDRESS = (process.env.NEXT_PUBLIC_CONTRACT_ADDRESS ||
-  "0xfD6BE144C962a5760b6F675FCCf72a721E247FF5") as `0x${string}`;
+  "0x3465bF7Ae4381214538c717e9851046575CeaE9c") as `0x${string}`;
 
 export const STUDIO_RPC = studionet.rpcUrls.default.http[0];
 export const EXPLORER = "https://explorer-studio.genlayer.com";
